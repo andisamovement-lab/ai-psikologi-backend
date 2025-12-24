@@ -2,5 +2,4 @@ fastapi
 uvicorn[standard]
 requests
 beautifulsoup4
-gradio_client
 cachetools
