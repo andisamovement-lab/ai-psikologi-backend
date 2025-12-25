@@ -1,16 +1,17 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import requests, time, re
+import requests, re
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
 
 app = FastAPI()
 
 # ================= CONFIG =================
-HF_API = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
+# Gemma open-source model (via HF inference)
+HF_API = "https://api-inference.huggingface.co/models/google/gemma-7b-it"
 
-CACHE = TTLCache(maxsize=500, ttl=900)      # cache jawaban
-MEMORY = {}                                 # memori percakapan per IP
+CACHE = TTLCache(maxsize=500, ttl=900)
+MEMORY = {}
 
 CRISIS_KEYWORDS = [
     "bunuh diri", "ingin mati", "tidak ingin hidup",
@@ -26,23 +27,8 @@ PSY_SITES = [
     "https://www.helpguide.org",
     "https://www.nimh.nih.gov",
     "https://www.apa.org",
-    "https://www.mind.org.uk",
-    "https://www.samhsa.gov",
     "https://www.ncbi.nlm.nih.gov",
     "https://www.frontiersin.org",
-    "https://www.mentalhealth.org.uk",
-    "https://www.anxietycanada.com",
-    "https://www.verywellhealth.com",
-    "https://www.psychologytools.com",
-    "https://www.goodtherapy.org",
-    "https://www.mentalhelp.net",
-    "https://www.therapistaid.com",
-    "https://www.psychology.org",
-    "https://www.medicalnewstoday.com",
-    "https://www.sciencedaily.com",
-    "https://www.betterhelp.com",
-    "https://www.talkspace.com",
-    "https://www.psychologyresearch.com"
 ]
 
 # ================= MIDDLEWARE =================
@@ -54,37 +40,68 @@ app.add_middleware(
 )
 
 # ================= UTIL =================
+def detect_language(text: str) -> str:
+    if re.search(r"[a-zA-Z]", text) and not re.search(r"[à-ÿ]", text):
+        if any(w in text.lower() for w in ["the", "and", "is", "are", "i feel"]):
+            return "en"
+    return "id"
+
 def is_crisis(text: str) -> bool:
     t = text.lower()
     return any(k in t for k in CRISIS_KEYWORDS)
 
-def crawl_psychology(query: str) -> str:
+def crawl_psychology() -> str:
     results = []
     for site in PSY_SITES:
         try:
             r = requests.get(site, timeout=4)
             soup = BeautifulSoup(r.text, "html.parser")
-            for p in soup.find_all("p")[:5]:
-                text = p.get_text().strip()
-                if len(text) > 120:
-                    results.append(text)
-            if len(results) >= 5:
+            for p in soup.find_all("p")[:3]:
+                txt = p.get_text().strip()
+                if len(txt) > 120:
+                    results.append(txt)
+            if len(results) >= 3:
                 break
         except:
             continue
-    return " ".join(results[:5])
+    return " ".join(results[:3])
 
-def cbt_act_prompt(user_text: str) -> str:
-    return f"""
-Gunakan pendekatan CBT dan ACT:
-- Validasi emosi tanpa menyangkal
-- Identifikasi pikiran otomatis (CBT)
-- Normalisasi pengalaman manusiawi
-- Dorong penerimaan & nilai hidup (ACT)
-- Ajukan 1 pertanyaan reflektif di akhir
+def build_prompt(user_text: str, memory: str, lang: str) -> str:
+    if lang == "en":
+        return f"""
+You are a professional mental health counselor.
+Be empathetic, calm, and non-judgmental.
+Do NOT give medical diagnosis.
 
-Ucapan klien:
+Conversation memory:
+{memory}
+
+Psychology reference:
+{crawl_psychology()}
+
+User message:
 "{user_text}"
+
+Respond in English with warmth and clarity.
+Ask one gentle reflective question at the end.
+"""
+    else:
+        return f"""
+Kamu adalah konselor kesehatan mental profesional.
+Gunakan bahasa Indonesia yang lembut, empatik, dan tidak menghakimi.
+JANGAN memberi diagnosis medis.
+
+Riwayat percakapan:
+{memory}
+
+Referensi psikologi:
+{crawl_psychology()}
+
+Ucapan pengguna:
+"{user_text}"
+
+Berikan jawaban yang menenangkan dan relevan.
+Ajukan satu pertanyaan reflektif di akhir.
 """
 
 def ai_generate(prompt: str) -> str:
@@ -96,48 +113,38 @@ def ai_generate(prompt: str) -> str:
             "return_full_text": False
         }
     }
-    r = requests.post(HF_API, json=payload, timeout=45)
+
+    r = requests.post(HF_API, json=payload, timeout=60)
+
     if r.status_code != 200:
         raise Exception("AI overload")
-    return r.json()[0]["generated_text"]
+
+    data = r.json()
+
+    if isinstance(data, list) and "generated_text" in data[0]:
+        return data[0]["generated_text"]
+
+    raise Exception("Invalid AI response")
 
 def smart_answer(user_text: str, memory: str) -> str:
-    knowledge = crawl_psychology(user_text)
-
-    prompt = f"""
-Kamu adalah konselor psikologi profesional.
-Gunakan bahasa lembut, empatik, tidak menghakimi.
-Jangan memberi diagnosis medis.
-
-Riwayat percakapan singkat:
-{memory}
-
-Pengetahuan psikologi:
-{knowledge}
-
-Instruksi konseling:
-{cbt_act_prompt(user_text)}
-
-Jawaban konselor:
-"""
+    lang = detect_language(user_text)
+    prompt = build_prompt(user_text, memory, lang)
 
     try:
-        ai = ai_generate(prompt)
-        if ai and len(ai.strip()) > 50:
-            return ai
+        answer = ai_generate(prompt)
+        if answer and len(answer.strip()) > 40:
+            return answer
         raise Exception()
     except:
-        # 🔥 fallback cerdas dari hasil crawl
-        if knowledge:
+        if lang == "en":
             return (
-                "Perasaan yang kamu alami sangat manusiawi dan valid.\n\n"
-                f"{knowledge[:800]}\n\n"
-                "Dari semua hal ini, bagian mana yang paling kamu rasakan saat ini?"
+                "I can sense that something feels heavy for you right now. "
+                "If you want, we can talk about it slowly, one step at a time."
             )
         else:
             return (
-                "Aku bisa merasakan ada sesuatu yang cukup menguras emosimu. "
-                "Kalau kamu mau, kita bisa bahas perlahan satu hal yang paling berat."
+                "Aku bisa merasakan ada hal yang cukup berat untukmu saat ini. "
+                "Jika kamu mau, kita bisa membahasnya perlahan."
             )
 
 # ================= API =================
@@ -147,7 +154,7 @@ async def chat(request: Request, data: dict):
     ip = request.client.host
 
     if not message:
-        return {"reply": "Aku di sini. Ceritakan apa yang sedang kamu rasakan."}
+        return {"reply": "Aku di sini. Silakan ceritakan apa yang kamu rasakan."}
 
     if message in CACHE:
         return {"reply": CACHE[message]}
