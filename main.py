@@ -1,29 +1,21 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import requests, re, hashlib
-from bs4 import BeautifulSoup
-from cachetools import TTLCache
+import google.generativeai as genai
+import os, re
+
+# ================= CONFIG =================
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    generation_config={
+        "temperature": 0.7,
+        "max_output_tokens": 500,
+    }
+)
 
 app = FastAPI()
 
-# ================= CONFIG =================
-HF_API = "https://api-inference.huggingface.co/models/google/gemma-7b-it"
-
-CACHE = TTLCache(maxsize=1000, ttl=900)
-SESSION = {}
-
-PSY_SITES = [
-    "https://www.psychologytoday.com",
-    "https://www.verywellmind.com",
-    "https://www.psychcentral.com",
-    "https://www.healthline.com",
-]
-
-CRISIS = [
-    "bunuh diri", "ingin mati", "suicide", "self harm", "melukai diri"
-]
-
-# ================= MIDDLEWARE =================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,237 +23,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================= CORE UTILS =================
+# ================= SESSION MEMORY =================
+SESSIONS = {}
+MAX_HISTORY = 6
+MAX_SUMMARY_LEN = 800
 
+# ================= UTIL =================
 def detect_language(text):
     return "en" if re.search(r"\b(what|why|how|should|i feel)\b", text.lower()) else "id"
 
 def classify_intent(text):
     t = text.lower()
+    if "apa yang harus" in t or "harus saya lakukan" in t:
+        return "ACTION"
+    if "kenapa" in t or "mengapa" in t:
+        return "WHY"
+    return "STATEMENT"
 
-    if re.search(r"(apa yang harus|harus saya lakukan|what should i do)", t):
-        return "ACTION_REQUEST"
-
-    if re.search(r"(kenapa|mengapa|why)", t):
-        return "WHY_QUESTION"
-
-    if len(t.split()) <= 4:
-        return "SHORT_EMOTION"
-
-    if re.search(r"(lelah|capek|penuh|sedih|bingung|dikhianati|stres)", t):
-        return "EMOTIONAL_STATEMENT"
-
-    return "GENERAL"
-
-def is_crisis(text):
-    return any(k in text.lower() for k in CRISIS)
-
-def ai_generate(prompt, temp=0.7, tokens=400):
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temp,
-            "max_new_tokens": tokens,
-            "return_full_text": False
-        }
-    }
-    r = requests.post(HF_API, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise Exception("HF overload")
-    return r.json()[0]["generated_text"].strip()
-
-# ================= LAYER 1 — FACT EXTRACTION =================
-
-def extract_facts(user_text, history):
+# ================= SUMMARY =================
+def summarize_history(history_text: str) -> str:
     prompt = f"""
-Ringkas FAKTA OBJEKTIF dari percakapan ini.
-JANGAN memberi saran.
-JANGAN empati.
+Ringkas percakapan berikut menjadi konteks singkat.
+Fokus pada:
+- kondisi emosional user
+- masalah utama
+- hal penting yang sudah terjadi
 
-Riwayat:
-{history}
+Percakapan:
+{history_text}
 
-Ucapan terbaru:
-"{user_text}"
-
-Fakta:
+Ringkasan:
 """
     try:
-        return ai_generate(prompt, temp=0.2, tokens=200)
+        r = model.generate_content(prompt)
+        return r.text.strip()[:MAX_SUMMARY_LEN]
     except:
-        return ""
+        return history_text[-MAX_SUMMARY_LEN:]
 
-# ================= LAYER 2 — KNOWLEDGE RETRIEVAL =================
-
-def retrieve_knowledge(facts):
-    keywords = []
-    f = facts.lower()
-
-    if "dikhianati" in f:
-        keywords += ["betrayal", "trust", "relationship trauma"]
-    if "lelah" in f or "penuh pikiran" in f:
-        keywords += ["mental overload", "stress", "emotional exhaustion"]
-    if not keywords:
-        keywords = ["emotional distress"]
-
-    snippets = []
-
-    for site in PSY_SITES:
-        try:
-            html = requests.get(site, timeout=4).text
-            soup = BeautifulSoup(html, "html.parser")
-            for p in soup.find_all("p"):
-                txt = p.get_text().lower()
-                if any(k in txt for k in keywords) and len(txt) > 120:
-                    snippets.append(p.get_text().strip())
-            if len(snippets) >= 2:
-                break
-        except:
-            continue
-
-    return " ".join(snippets[:2])
-
-# ================= LAYER 3 — RESPONSE PLANNER =================
-
-def build_prompt(user_text, facts, knowledge, intent, lang, last_reply):
-
-    anti_repeat = f"""
-ATURAN PENTING:
-- JANGAN mengulang struktur atau kalimat berikut:
-"{last_reply}"
-"""
+# ================= PROMPT =================
+def build_prompt(user_text, session, intent, lang):
+    summary = session.get("summary", "")
+    history = "\n".join(session.get("history", []))
 
     if lang == "id":
-
-        if intent == "ACTION_REQUEST":
-            task = """
-User meminta TINDAKAN.
-WAJIB:
-- Berikan 2–3 langkah konkret
-- Tidak boleh hanya empati
-- Tidak bertanya balik
-"""
-
-        elif intent in ["EMOTIONAL_STATEMENT", "SHORT_EMOTION"]:
-            task = """
-User menyatakan kondisi emosional.
-WAJIB:
-- Validasi spesifik
-- Jelaskan penyebab psikologis singkat
-- Boleh 1 pertanyaan relevan
-"""
-
-        elif intent == "WHY_QUESTION":
-            task = """
-User bertanya ALASAN.
-WAJIB:
-- Jelaskan sebab psikologis
-- Jangan normatif
-"""
-
+        if intent == "ACTION":
+            task = "Berikan solusi konkret, jelas, dan realistis."
+        elif intent == "WHY":
+            task = "Jelaskan penyebabnya secara psikologis dan masuk akal."
         else:
-            task = "Tanggapi secara bernalar dan relevan."
+            task = "Tanggapi dengan empati yang spesifik dan relevan."
 
         return f"""
-Kamu adalah AI konselor yang CERDAS dan KONTEKSTUAL.
+Kamu adalah AI konselor cerdas seperti ChatGPT.
 
-FAKTA USER:
-{facts}
+KONTEKS RINGKAS:
+{summary}
 
-PENGETAHUAN RELEVAN:
-{knowledge}
+RIWAYAT TERAKHIR:
+{history}
 
-INTENT USER:
-{intent}
-
-{anti_repeat}
-
-INSTRUKSI:
-{task}
-
-Ucapan user:
+UCAPAN USER:
 "{user_text}"
+
+TUGAS:
+{task}
 
 Jawaban terbaik:
 """
-
     else:
         return f"""
 You are an intelligent counselor.
 
-FACTS:
-{facts}
+Context:
+{summary}
 
-KNOWLEDGE:
-{knowledge}
-
-INTENT:
-{intent}
-
-Avoid repeating:
-"{last_reply}"
+Conversation:
+{history}
 
 User:
 "{user_text}"
 
-Answer intelligently:
+Respond clearly and helpfully:
 """
 
-# ================= RESPONSE ENGINE =================
-
+# ================= CORE =================
 def generate_reply(user_text, session):
     lang = detect_language(user_text)
     intent = classify_intent(user_text)
 
-    history = session.get("history", "")
-    last_reply = session.get("last_reply", "")
+    prompt = build_prompt(user_text, session, intent, lang)
 
-    facts = extract_facts(user_text, history)
-    knowledge = retrieve_knowledge(facts)
+    response = model.generate_content(prompt)
+    if not response or not response.text:
+        raise Exception("Empty response")
 
-    prompt = build_prompt(
-        user_text, facts, knowledge, intent, lang, last_reply
-    )
-
-    reply = ai_generate(prompt)
-
-    # anti jawaban kosong / generik
-    if len(reply) < 60:
-        raise Exception("Weak response")
-
-    return reply
+    return response.text.strip()
 
 # ================= API =================
-
 @app.post("/chat")
 async def chat(request: Request, data: dict):
-    msg = data.get("message", "").strip()
+    user_text = data.get("message", "").strip()
     sid = request.client.host
 
-    if not msg:
+    if not user_text:
         return {"reply": "Aku di sini. Silakan ceritakan apa yang sedang kamu alami."}
 
-    if is_crisis(msg):
-        return {"reply":
-            "Aku sangat menyesal kamu merasa seberat ini.\n\n"
-            "📞 Indonesia:\n"
-            "- Sejiwa 119 ext. 8\n"
-            "- Kemenkes 1500-454\n\n"
-            "Jika kamu mau, ceritakan apa yang membuatmu merasa seperti ini."
-        }
+    session = SESSIONS.get(sid, {"history": [], "summary": ""})
 
-    session = SESSION.get(sid, {"history": "", "last_reply": ""})
+    reply = generate_reply(user_text, session)
 
-    try:
-        reply = generate_reply(msg, session)
-    except:
-        reply = (
-            "Situasi ini jelas tidak mudah. Kita bisa membaginya menjadi bagian yang lebih kecil agar lebih bisa ditangani."
-        )
+    # simpan history
+    session["history"].append(f"User: {user_text}")
+    session["history"].append(f"AI: {reply}")
 
-    session["history"] += f"\nUser: {msg}"
-    session["last_reply"] = reply
-    SESSION[sid] = session
+    # summarization jika terlalu panjang
+    if len(session["history"]) > MAX_HISTORY:
+        combined = "\n".join(session["history"])
+        session["summary"] = summarize_history(combined)
+        session["history"] = []
+
+    SESSIONS[sid] = session
 
     return {"reply": reply}
 
