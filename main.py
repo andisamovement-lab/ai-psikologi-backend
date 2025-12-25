@@ -1,6 +1,7 @@
 import os
 from fastapi import FastAPI
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import google.genai as genai
 
 API_KEY = os.getenv("GEMINI_API_KEY")
@@ -11,13 +12,26 @@ client = genai.Client(api_key=API_KEY)
 
 app = FastAPI()
 
+# CORS (WAJIB)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class ChatRequest(BaseModel):
     message: str
 
 def generate_reply(text: str) -> str:
     prompt = f"""
 Kamu adalah AI konselor psikologi yang cerdas dan kontekstual.
-Jawab langsung, relevan, dan tidak mengulang template.
+
+Aturan:
+- Jawab sesuai konteks
+- Jangan mengulang template
+- Gunakan bahasa user
 
 User:
 {text}
